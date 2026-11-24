@@ -13,6 +13,8 @@ test("live: create, get, list, delete one tracking", { skip: !process.env.TRACKI
     const d = await client.carriers.detect("9434650110837017316201");
     assert.ok(d.candidates.length > 0);
     assert.ok((await client.usage.get()).plan);
+    assert.equal((await client.health()).status, "ok");
+    assert.equal((await client.carriers.resolve("USPS Priority Mail"))?.carrier, "usps");
   } finally {
     const del = await client.trackings.delete(t.id);
     assert.equal(del.deleted, true);

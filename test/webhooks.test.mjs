@@ -65,3 +65,56 @@ test("instance helpers match the static ones", async () => {
   const client = new Trackified({ apiKey: "k", fetch: async () => new Response() });
   assert.equal(await client.webhooks.verify(body, header, secret, { now: t }), true);
 });
+
+// Dual-signature vector (secret rotation): B's signature first, then A's.
+const secretB = "whsec_trackified_test_vector_b";
+const sigB = "aaa4b846892609125e20b07a531d46e9e4614d8eec8d6dd3ecccae877b58111f";
+const dual = `t=${t},v1=${sigB},v1=${sig}`;
+
+test("dual-signature header verifies with A, B and [A, B]", async () => {
+  assert.equal(await verify(body, dual, secret, { now: t }), true); // only the second v1 matches
+  assert.equal(await verify(body, dual, secretB, { now: t }), true);
+  assert.equal(await verify(body, dual, [secret, secretB], { now: t }), true);
+  assert.equal(await verify(body, dual, ["whsec_other", secretB], { now: t }), true);
+  assert.equal(await verify(body, dual, ["whsec_other"], { now: t }), false);
+});
+
+test("verifyDetailed reports the reason", async () => {
+  const { verifyDetailed } = Trackified.webhooks;
+  const cases = [
+    [header, secret, t, { valid: true }],
+    ["", secret, t, { valid: false, reason: "missing" }],
+    [null, secret, t, { valid: false, reason: "missing" }],
+    [header, "", t, { valid: false, reason: "missing" }],
+    [header, [], t, { valid: false, reason: "missing" }],
+    ["garbage", secret, t, { valid: false, reason: "malformed" }],
+    [`t=${t}`, secret, t, { valid: false, reason: "malformed" }],
+    [`v1=${sig}`, secret, t, { valid: false, reason: "malformed" }],
+    [`t=abc,v1=${sig}`, secret, t, { valid: false, reason: "malformed" }],
+    [`t=${t},v1=zz`, secret, t, { valid: false, reason: "malformed" }],
+    [header, secret, t + 301, { valid: false, reason: "timestamp" }],
+    [header, "whsec_other", t, { valid: false, reason: "mismatch" }],
+  ];
+  for (const [h, s, now, want] of cases) {
+    assert.deepEqual(await verifyDetailed(body, h, s, { now }), want, `${h} ${s}`);
+  }
+});
+
+test("constructEvent errors carry .reason", async () => {
+  await assert.rejects(
+    constructEvent(body, header, secret, { now: t + 301 }),
+    (e) => e instanceof SignatureVerificationError && e.reason === "timestamp",
+  );
+  await assert.rejects(
+    constructEvent(body, header, "whsec_other", { now: t }),
+    (e) => e instanceof SignatureVerificationError && e.reason === "mismatch",
+  );
+});
+
+test("trackingOf returns the tracking for every event type", () => {
+  const tr = { id: "trk_1" };
+  const { trackingOf } = Trackified.webhooks;
+  assert.equal(trackingOf({ id: "e", type: "tracking.delivered", data: tr }), tr);
+  const changed = { tracking: tr, previous_status: "in_transit", current_status: "delivered" };
+  assert.equal(trackingOf({ id: "e", type: "tracking.status_changed", data: changed }), tr);
+});

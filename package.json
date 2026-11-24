@@ -1,6 +1,6 @@
 {
   "name": "trackified",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Official TypeScript/Node client for the Trackified parcel-tracking API",
   "license": "MIT",
   "author": "Trackified",

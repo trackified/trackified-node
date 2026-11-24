@@ -36,13 +36,16 @@ export const WEBHOOK_EVENT_TYPES = [
 export type WebhookEventType = (typeof WEBHOOK_EVENT_TYPES)[number];
 
 export interface TrackingEvent {
-  /** ISO 8601; with an offset only when time_zone_known. null when unreadable. */
+  /**
+   * ISO 8601, null when unreadable. When the carrier gives an offset it is included and
+   * time_zone_known is true; a zoneless value is the local time where the scan happened.
+   */
   occurred_at: string | null;
   time_zone_known: boolean;
   status: EventStatus;
   description: string;
   location: string;
-  /** @deprecated Use occurred_at. */
+  /** @deprecated Use occurred_at. Sent until 2027-06-01, removed after 2027-06-01. */
   date: string | null;
 }
 
@@ -52,7 +55,7 @@ export interface Tracking {
   carrier: string | null;
   carrier_detected: boolean;
   status: TrackingStatus;
-  /** Newest first. */
+  /** Newest first (sorted by occurred_at desc; guaranteed by the API). */
   events: TrackingEvent[];
   estimated_delivery: string | null;
   delivered_at: string | null;
@@ -70,7 +73,10 @@ export interface Tracking {
 
 export interface TrackingCreateParams {
   tracking_number: string;
-  /** Leave out to detect it from the number (422 carrier_not_detected if unsure). */
+  /**
+   * Our carrier id or a free-text name ("USPS Priority Mail", "dhl_express"); the response shows our id.
+   * Leave out to detect it from the number (422 carrier_not_detected if unsure).
+   */
   carrier?: string;
   /** Your own reference, such as an order number. */
   custom_id?: string;
@@ -122,10 +128,25 @@ export interface RetrackResult {
 
 export interface Carrier {
   id: string;
-  /** The live API returns displayName; the spec documents display_name. */
+  /** @deprecated Use display_name; the API sends both. */
   displayName?: string;
   display_name?: string;
+  /** Other names and provider slugs that resolve to this carrier. */
+  aliases?: string[];
   [key: string]: unknown;
+}
+
+export interface CarrierResolution {
+  /** Our carrier id. */
+  carrier: string;
+  name: string;
+  confidence: number;
+  matched: "id" | "alias" | "name" | "provider_slug" | "prefix";
+}
+
+export interface Health {
+  status: "ok" | "degraded";
+  checks?: Record<string, unknown>;
 }
 
 export interface CarrierCandidate {
@@ -186,6 +207,22 @@ export interface WebhookCreateParams {
   event_types?: WebhookEventType[];
 }
 
+/** At least one field. */
+export interface WebhookUpdateParams {
+  url?: string;
+  eventTypes?: WebhookEventType[];
+  enabled?: boolean;
+}
+
+export interface WebhookRotateSecretParams {
+  /** How long the previous secret keeps verifying (0-168, default 24; 0 drops it at once). */
+  expiresInHours?: number;
+}
+
+export interface WebhookRotatedSecret extends WebhookWithSecret {
+  previous_secret_expires_at: string | null;
+}
+
 export interface WebhookTestResult {
   signature: string;
   body: WebhookEvent;
@@ -237,12 +274,32 @@ export interface Usage {
   carrier_volume: Array<{ carrier: string; count: number }>;
 }
 
-export interface WebhookEvent<T = Tracking> {
-  id: string;
-  type: WebhookEventType;
-  created_at?: string;
-  data: T;
+export interface StatusChangedData {
+  tracking: Tracking;
+  previous_status: TrackingStatus;
+  current_status: TrackingStatus;
 }
+
+interface BaseEvent<K extends WebhookEventType, D> {
+  id: string;
+  type: K;
+  created_at?: string;
+  data: D;
+}
+
+export type TrackingStatusChangedEvent = BaseEvent<"tracking.status_changed", StatusChangedData>;
+export type TrackingDataEvent = {
+  [K in Exclude<WebhookEventType, "tracking.status_changed">]: BaseEvent<K, Tracking>;
+}[Exclude<WebhookEventType, "tracking.status_changed">];
+
+/**
+ * Discriminated by `type`: tracking.status_changed carries {tracking, previous_status, current_status},
+ * every other type carries the Tracking. Use Trackified.webhooks.trackingOf(event) for either.
+ * WebhookEvent<T> (0.1 form) is still accepted for a custom data type.
+ */
+export type WebhookEvent<T = never> = [T] extends [never]
+  ? TrackingStatusChangedEvent | TrackingDataEvent
+  : { id: string; type: WebhookEventType; created_at?: string; data: T };
 
 export interface RequestOptions {
   /** Sent on POSTs that create trackings; generated automatically when omitted. */

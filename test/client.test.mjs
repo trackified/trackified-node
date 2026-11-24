@@ -4,8 +4,10 @@ import { test } from "node:test";
 import Trackified, {
   APIError,
   AuthenticationError,
+  ConflictError,
   ConnectionError,
   NotFoundError,
+  QuotaExceededError,
   RateLimitError,
   TrackifiedError,
   ValidationError,
@@ -92,6 +94,10 @@ test("each resource hits the spec path", async () => {
     [(c) => c.webhooks.create({ url: "https://x.test" }), "POST", "/v1/webhooks"],
     [(c) => c.webhooks.list(), "GET", "/v1/webhooks"],
     [(c) => c.webhooks.delete("wh_1"), "DELETE", "/v1/webhooks/wh_1"],
+    [(c) => c.webhooks.update("wh_1", { enabled: false }), "PATCH", "/v1/webhooks/wh_1"],
+    [(c) => c.webhooks.rotateSecret("wh_1"), "POST", "/v1/webhooks/wh_1/rotate-secret"],
+    [(c) => c.carriers.resolve("USPS Priority"), "GET", "/v1/carriers/resolve?name=USPS+Priority"],
+    [(c) => c.health(), "GET", "/v1/health"],
     [(c) => c.webhooks.test("wh_1"), "POST", "/v1/webhooks/wh_1/test"],
     [(c) => c.webhookDeliveries.list({ limit: 5 }), "GET", "/v1/webhook-deliveries?limit=5"],
     [(c) => c.apiKeys.create({ name: "ci", mode: "test" }), "POST", "/v1/account/api-keys"],
@@ -135,7 +141,8 @@ test("errors map to typed classes with status, code and request id", async () =>
     [404, NotFoundError],
     [400, ValidationError],
     [422, ValidationError],
-    [402, TrackifiedError],
+    [402, QuotaExceededError],
+    [409, ConflictError],
   ];
   for (const [status, Cls] of cases) {
     const { client } = make([err(status, "c")]);
@@ -152,8 +159,11 @@ test("errors map to typed classes with status, code and request id", async () =>
 });
 
 test("does not retry other 4xx", async () => {
-  const { fetch, client } = make([{ status: 409, body: { error: { code: "conflict" } } }]);
-  await assert.rejects(client.trackings.create({ tracking_number: "1" }), TrackifiedError);
+  const { fetch, client } = make([{ status: 409, body: { error: { code: "idempotency_in_progress" } } }]);
+  await assert.rejects(
+    client.trackings.create({ tracking_number: "1" }),
+    (e) => e instanceof ConflictError && e.code === "idempotency_in_progress",
+  );
   assert.equal(fetch.calls.length, 1);
 });
 
@@ -182,7 +192,7 @@ test("retries network errors, then raises ConnectionError", async () => {
   assert.equal(fetch.calls.length, 2);
 
   const m = make([new TypeError("fetch failed")], { maxRetries: 0 });
-  await assert.rejects(m.client.usage.get(), ConnectionError);
+  await assert.rejects(m.client.usage.get(), (e) => e instanceof ConnectionError && e.code === "connection");
 });
 
 test("times out", async () => {
@@ -191,7 +201,7 @@ test("times out", async () => {
   const client = new Trackified({ apiKey: "k", fetch, timeout: 20, maxRetries: 0 });
   await assert.rejects(
     client.usage.get(),
-    (e) => e instanceof ConnectionError && /timed out/.test(e.message),
+    (e) => e instanceof ConnectionError && e.code === "timeout" && /timed out/.test(e.message),
   );
 });
 
@@ -199,4 +209,86 @@ test("base URL from option or env", async () => {
   const { fetch, client } = make([{ body: {} }], { baseURL: "http://localhost:8080/" });
   await client.usage.get();
   assert.equal(fetch.calls[0].url.href, "http://localhost:8080/v1/account/usage");
+});
+
+test("base URL accepts the host with or without /v1, never /v1/v1", async () => {
+  for (const baseURL of [
+    "https://api.trackified.net",
+    "https://api.trackified.net/",
+    "https://api.trackified.net/v1",
+    "https://api.trackified.net/v1/",
+  ]) {
+    const { fetch, client } = make([{ body: {} }], { baseURL });
+    assert.equal(client.baseURL, "https://api.trackified.net");
+    await client.usage.get();
+    assert.equal(fetch.calls[0].url.href, "https://api.trackified.net/v1/account/usage", baseURL);
+  }
+});
+
+test("carriers.resolve returns the match or null", async () => {
+  const hit = { carrier: "usps", name: "USPS", confidence: 0.97, matched: "alias" };
+  const { client } = make([{ body: hit }, { body: { carrier: null, confidence: 0 } }]);
+  assert.deepEqual(await client.carriers.resolve("USPS Priority Mail"), hit);
+  assert.equal(await client.carriers.resolve("nope"), null);
+});
+
+test("webhooks.update and rotateSecret send snake_case bodies; rotate is not retried", async () => {
+  const { fetch, client } = make([{ body: {} }, { status: 503, body: {} }]);
+  await client.webhooks.update("wh_1", { url: "https://x.test", eventTypes: ["tracking.delivered"] });
+  assert.deepEqual(JSON.parse(fetch.calls[0].body), {
+    url: "https://x.test",
+    event_types: ["tracking.delivered"],
+  });
+  await assert.rejects(client.webhooks.rotateSecret("wh_1", { expiresInHours: 0 }), APIError);
+  assert.deepEqual(JSON.parse(fetch.calls[1].body), { expires_in_hours: 0 });
+  assert.equal(fetch.calls.length, 2);
+});
+
+test("hooks fire once per attempt with request details; throwing hooks are ignored", async () => {
+  const seen = [];
+  const { client } = make(
+    [
+      { status: 500, body: { error: { code: "boom" } }, headers: { "x-request-id": "req_a" } },
+      new TypeError("fetch failed"),
+      { status: 201, body: tracking, headers: { "x-request-id": "req_c", "idempotent-replayed": "true" } },
+    ],
+    {
+      maxRetries: 2,
+      onRequest: (i) => {
+        seen.push(["req", i]);
+        throw new Error("hook bug");
+      },
+      onResponse: (i) => {
+        seen.push(["res", i]);
+        throw new Error("hook bug");
+      },
+    },
+  );
+  const t = await client.trackings.create({ tracking_number: "1Z" }, { idempotencyKey: "k1" });
+  assert.equal(t.id, "trk_1");
+  assert.deepEqual(
+    seen.map(([k, i]) => [k, i.attempt]),
+    [
+      ["req", 0],
+      ["res", 0],
+      ["req", 1],
+      ["res", 1],
+      ["req", 2],
+      ["res", 2],
+    ],
+  );
+  const [r0, r1, r2] = seen.filter(([k]) => k === "res").map(([, i]) => i);
+  assert.equal(seen[0][1].method, "POST");
+  assert.equal(seen[0][1].url, "https://api.trackified.net/v1/trackings");
+  assert.equal(seen[0][1].idempotencyKey, "k1");
+  assert.equal(r0.status, 500);
+  assert.equal(r0.requestId, "req_a");
+  assert.ok(r0.error instanceof APIError && r0.error.code === "boom");
+  assert.equal(r1.status, undefined);
+  assert.ok(r1.error instanceof ConnectionError && r1.error.code === "connection");
+  assert.equal(r2.status, 201);
+  assert.equal(r2.requestId, "req_c");
+  assert.equal(r2.idempotentReplayed, true);
+  assert.equal(r2.error, undefined);
+  assert.ok(r2.durationMs >= 0);
 });

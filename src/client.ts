@@ -7,8 +7,10 @@ import type {
   CarrierCatalog,
   CarrierCatalogParams,
   CarrierDetection,
+  CarrierResolution,
   CarrierValidationStatus,
   DeleteResult,
+  Health,
   Page,
   PageParams,
   RequestOptions,
@@ -21,11 +23,32 @@ import type {
   Webhook,
   WebhookCreateParams,
   WebhookDelivery,
+  WebhookRotatedSecret,
+  WebhookRotateSecretParams,
   WebhookTestResult,
+  WebhookUpdateParams,
   WebhookWithSecret,
 } from "./types.js";
 import { VERSION } from "./version.js";
-import { constructEvent, getCrypto, verify, webhookHelpers } from "./webhooks.js";
+import { constructEvent, getCrypto, trackingOf, verify, verifyDetailed, webhookHelpers } from "./webhooks.js";
+
+export interface RequestHookInfo {
+  method: string;
+  url: string;
+  /** 0 for the first try, then 1, 2 ... for retries. */
+  attempt: number;
+  idempotencyKey: string | undefined;
+}
+
+export interface ResponseHookInfo extends RequestHookInfo {
+  /** undefined when no response arrived. */
+  status: number | undefined;
+  requestId: string | undefined;
+  idempotentReplayed: boolean;
+  durationMs: number;
+  /** The typed error for status >= 400 or a failed connection. */
+  error?: TrackifiedError;
+}
 
 export interface ClientOptions {
   /** Defaults to the TRACKIFIED_API_KEY environment variable. */
@@ -40,6 +63,10 @@ export interface ClientOptions {
   fetch?: typeof fetch;
   /** Extra headers sent with every request. */
   defaultHeaders?: Record<string, string>;
+  /** Called before each attempt. Errors it throws are ignored. */
+  onRequest?: (info: RequestHookInfo) => void;
+  /** Called after each attempt. Errors it throws are ignored. */
+  onResponse?: (info: ResponseHookInfo) => void;
 }
 
 type Query = Record<string, string | number | boolean | undefined>;
@@ -77,6 +104,8 @@ export class Trackified {
   #apiKey: string;
   #fetch: typeof fetch;
   #headers: Record<string, string>;
+  #onRequest: ClientOptions["onRequest"];
+  #onResponse: ClientOptions["onResponse"];
 
   constructor(options: ClientOptions = {}) {
     const apiKey = options.apiKey ?? env("TRACKIFIED_API_KEY");
@@ -86,16 +115,23 @@ export class Trackified {
       );
     }
     this.#apiKey = apiKey;
-    this.baseURL = (options.baseURL ?? env("TRACKIFIED_BASE_URL") ?? "https://api.trackified.net").replace(
-      /\/+$/,
-      "",
-    );
+    // Accept the host with or without /v1; paths below add /v1 themselves.
+    this.baseURL = (options.baseURL ?? env("TRACKIFIED_BASE_URL") ?? "https://api.trackified.net")
+      .replace(/\/+$/, "")
+      .replace(/\/v1$/, "");
     this.timeout = options.timeout ?? 30_000;
     this.maxRetries = options.maxRetries ?? 2;
     const f = options.fetch ?? globalThis.fetch;
     if (!f) throw new TrackifiedError("No fetch available; pass { fetch } (Node >= 18 has it built in).");
     this.#fetch = f;
     this.#headers = options.defaultHeaders ?? {};
+    this.#onRequest = options.onRequest;
+    this.#onResponse = options.onResponse;
+  }
+
+  /** GET /v1/health: {status: "ok"}, or "degraded" with checks (503 raises APIError). */
+  health(opts?: RequestOptions): Promise<Health> {
+    return this.request("GET", "/v1/health", opts);
   }
 
   /** Low-level request. Resource methods are preferred. */
@@ -118,7 +154,18 @@ export class Trackified {
     const maxRetries = init.maxRetries ?? this.maxRetries;
     const timeout = init.timeout ?? this.timeout;
 
+    const hookBase = { method, url: url.href, idempotencyKey: headers["idempotency-key"] };
+    const hook = <I>(fn: ((info: I) => void) | undefined, info: I) => {
+      try {
+        fn?.(info);
+      } catch {
+        // a throwing hook must never break the request
+      }
+    };
+
     for (let attempt = 0; ; attempt++) {
+      hook(this.#onRequest, { ...hookBase, attempt });
+      const started = Date.now();
       const controller = new AbortController();
       const onAbort = () => controller.abort(init.signal?.reason);
       init.signal?.addEventListener("abort", onAbort, { once: true });
@@ -127,30 +174,44 @@ export class Trackified {
       try {
         res = await this.#fetch(url, { method, headers, body, signal: controller.signal });
       } catch (e) {
+        const timedOut = controller.signal.aborted && !init.signal?.aborted;
+        const error = timedOut
+          ? new ConnectionError(`Request timed out after ${timeout} ms`, { cause: e, code: "timeout" })
+          : new ConnectionError(`Connection error: ${(e as Error)?.message ?? e}`, {
+              cause: e,
+              code: "connection",
+            });
+        hook(this.#onResponse, {
+          ...hookBase,
+          attempt,
+          status: undefined,
+          requestId: undefined,
+          idempotentReplayed: false,
+          durationMs: Date.now() - started,
+          error,
+        });
         if (init.signal?.aborted) throw e;
         if (attempt < maxRetries) {
           await sleep(backoff(attempt));
           continue;
         }
-        const msg = controller.signal.aborted
-          ? `Request timed out after ${timeout} ms`
-          : `Connection error: ${(e as Error)?.message ?? e}`;
-        throw new ConnectionError(msg, { cause: e });
+        throw error;
       } finally {
         clearTimeout(timer);
         init.signal?.removeEventListener("abort", onAbort);
       }
 
+      const info = {
+        ...hookBase,
+        attempt,
+        status: res.status,
+        requestId: res.headers.get("x-request-id") ?? undefined,
+        idempotentReplayed: res.headers.get("idempotent-replayed") === "true",
+      };
       if (res.ok) {
         const text = await res.text();
+        hook(this.#onResponse, { ...info, durationMs: Date.now() - started });
         return (text ? JSON.parse(text) : null) as T;
-      }
-      const retryable = res.status === 408 || res.status === 429 || res.status >= 500;
-      if (retryable && attempt < maxRetries) {
-        await res.body?.cancel().catch(() => {});
-        const ra = parseRetryAfter(res.headers);
-        await sleep(ra !== undefined ? Math.min(ra, 60) * 1000 : backoff(attempt));
-        continue;
       }
       let parsed: unknown;
       try {
@@ -158,7 +219,15 @@ export class Trackified {
       } catch {
         parsed = undefined;
       }
-      throw errorFromResponse(res.status, parsed, res.headers);
+      const error = errorFromResponse(res.status, parsed, res.headers);
+      hook(this.#onResponse, { ...info, durationMs: Date.now() - started, error });
+      const retryable = res.status === 408 || res.status === 429 || res.status >= 500;
+      if (retryable && attempt < maxRetries) {
+        const ra = parseRetryAfter(res.headers);
+        await sleep(ra !== undefined ? Math.min(ra, 60) * 1000 : backoff(attempt));
+        continue;
+      }
+      throw error;
     }
   }
 
@@ -241,6 +310,18 @@ export class Carriers extends Resource {
   search(params: CarrierCatalogParams = {}, opts?: RequestOptions): Promise<CarrierCatalog> {
     return this.client.request("GET", "/v1/carriers/catalog", { ...opts, query: { ...params } });
   }
+  /** Map a free-text carrier name or another provider's slug to our id; null when unknown or unsupported. */
+  async resolve(name: string, opts?: RequestOptions): Promise<CarrierResolution | null> {
+    const r = await this.client.request<CarrierResolution | { carrier: null }>(
+      "GET",
+      "/v1/carriers/resolve",
+      {
+        ...opts,
+        query: { name },
+      },
+    );
+    return r?.carrier ? (r as CarrierResolution) : null;
+  }
   /** How each carrier has been validated. */
   validationStatus(opts?: RequestOptions): Promise<CarrierValidationStatus> {
     return this.client.request("GET", "/v1/carriers/status", opts);
@@ -258,6 +339,26 @@ export class Webhooks extends Resource {
   iterate(params: PageParams = {}, opts?: RequestOptions): AsyncGenerator<Webhook> {
     return this.client.paginate("/v1/webhooks", { ...params }, opts);
   }
+  /** Change url, event types or enabled; the secret is unchanged. */
+  update(id: string, params: WebhookUpdateParams, opts?: RequestOptions): Promise<Webhook> {
+    const body = { url: params.url, event_types: params.eventTypes, enabled: params.enabled };
+    return this.client.request("PATCH", `/v1/webhooks/${enc(id)}`, { ...opts, body });
+  }
+  /**
+   * New signing secret, shown once. The old one keeps verifying for expiresInHours (default 24).
+   * Not retried by default: a second rotation would end the first new secret's window unseen.
+   */
+  rotateSecret(
+    id: string,
+    params: WebhookRotateSecretParams = {},
+    opts?: RequestOptions,
+  ): Promise<WebhookRotatedSecret> {
+    return this.client.request("POST", `/v1/webhooks/${enc(id)}/rotate-secret`, {
+      maxRetries: 0,
+      ...opts,
+      body: { expires_in_hours: params.expiresInHours },
+    });
+  }
   delete(id: string, opts?: RequestOptions): Promise<null> {
     return this.client.request("DELETE", `/v1/webhooks/${enc(id)}`, opts);
   }
@@ -266,7 +367,9 @@ export class Webhooks extends Resource {
     return this.client.request("POST", `/v1/webhooks/${enc(id)}/test`, opts);
   }
   verify = verify;
+  verifyDetailed = verifyDetailed;
   constructEvent = constructEvent;
+  trackingOf = trackingOf;
 }
 
 export class WebhookDeliveries extends Resource {

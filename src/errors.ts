@@ -29,8 +29,28 @@ export class PermissionError extends TrackifiedError {}
 export class NotFoundError extends TrackifiedError {}
 export class ValidationError extends TrackifiedError {}
 export class APIError extends TrackifiedError {}
-export class ConnectionError extends TrackifiedError {}
-export class SignatureVerificationError extends TrackifiedError {}
+/** 402 quota_exceeded: the plan's monthly tracking quota is used up. */
+export class QuotaExceededError extends TrackifiedError {}
+/** 409, including idempotency_in_progress (the same key is still being processed). Not retried. */
+export class ConflictError extends TrackifiedError {}
+
+/**
+ * The request did not get a response. code is "timeout" or "connection".
+ * After a timeout the outcome is unknown: retry with the same idempotency key.
+ */
+export class ConnectionError extends TrackifiedError {
+  declare readonly code: "timeout" | "connection";
+}
+
+export type SignatureFailureReason = "missing" | "malformed" | "timestamp" | "mismatch";
+
+export class SignatureVerificationError extends TrackifiedError {
+  readonly reason: SignatureFailureReason;
+  constructor(message: string, init: ErrorInit & { reason: SignatureFailureReason }) {
+    super(message, init);
+    this.reason = init.reason;
+  }
+}
 
 export class RateLimitError extends TrackifiedError {
   /** Seconds to wait, from the retry-after header. */
@@ -53,6 +73,8 @@ export function errorFromResponse(status: number, body: unknown, headers: Header
   if (status === 403) return new PermissionError(message, init);
   if (status === 404) return new NotFoundError(message, init);
   if (status === 400 || status === 422) return new ValidationError(message, init);
+  if (status === 402) return new QuotaExceededError(message, init);
+  if (status === 409) return new ConflictError(message, init);
   if (status === 429) {
     return new RateLimitError(message, { ...init, retryAfter: parseRetryAfter(headers) });
   }
