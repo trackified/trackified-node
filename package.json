@@ -1,0 +1,59 @@
+{
+  "name": "trackified",
+  "version": "0.1.0",
+  "description": "Official TypeScript/Node client for the Trackified parcel-tracking API",
+  "license": "MIT",
+  "author": "Trackified",
+  "homepage": "https://forumulate.com/p/trackified/docs",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/trackified/trackified-node.git"
+  },
+  "bugs": "https://github.com/trackified/trackified-node/issues",
+  "keywords": [
+    "trackified",
+    "parcel-tracking",
+    "shipping",
+    "tracking",
+    "sdk",
+    "webhooks"
+  ],
+  "type": "module",
+  "engines": {
+    "node": ">=18"
+  },
+  "sideEffects": false,
+  "main": "./dist/cjs/index.js",
+  "module": "./dist/esm/index.js",
+  "types": "./dist/cjs/index.d.ts",
+  "exports": {
+    ".": {
+      "import": {
+        "types": "./dist/esm/index.d.ts",
+        "default": "./dist/esm/index.js"
+      },
+      "require": {
+        "types": "./dist/cjs/index.d.ts",
+        "default": "./dist/cjs/index.js"
+      }
+    },
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "rm -rf dist && tsc -p tsconfig.json && tsc -p tsconfig.cjs.json && echo '{\"type\":\"commonjs\"}' > dist/cjs/package.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "lint": "biome check .",
+    "format": "biome check --write .",
+    "test": "npm run build && node --test test/",
+    "prepare": "npm run build",
+    "prepublishOnly": "npm test"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "2.6.8",
+    "@types/node": "^18.19.0",
+    "typescript": "~5.9.3"
+  }
+}
