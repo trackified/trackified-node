@@ -47,7 +47,7 @@
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "lint": "biome check .",
     "format": "biome check --write .",
-    "test": "npm run build && node --test test/",
+    "test": "npm run build && node --test test/*.test.mjs test/*.test.cjs",
     "prepare": "npm run build",
     "prepublishOnly": "npm test"
   },
