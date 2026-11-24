@@ -204,6 +204,7 @@ export interface WebhookWithSecret extends Webhook {
 
 export interface WebhookCreateParams {
   url: string;
+  /** Default: ["tracking.updated", "tracking.delivered"]. */
   event_types?: WebhookEventType[];
 }
 

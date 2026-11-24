@@ -269,12 +269,12 @@ test("hooks fire once per attempt with request details; throwing hooks are ignor
   assert.deepEqual(
     seen.map(([k, i]) => [k, i.attempt]),
     [
-      ["req", 0],
-      ["res", 0],
       ["req", 1],
       ["res", 1],
       ["req", 2],
       ["res", 2],
+      ["req", 3],
+      ["res", 3],
     ],
   );
   const [r0, r1, r2] = seen.filter(([k]) => k === "res").map(([, i]) => i);

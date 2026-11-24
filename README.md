@@ -47,12 +47,12 @@ for await (const t of client.trackings.iterate({ status: "delivered" })) {
 
 ```ts
 new Trackified({
-  apiKey: "tk_live_…",                     // default: env TRACKIFIED_API_KEY
+  apiKey: "live_…",                        // default: env TRACKIFIED_API_KEY
   baseURL: "https://api.trackified.net",   // default: env TRACKIFIED_BASE_URL or this; a trailing /v1 is fine
   timeout: 30_000,                         // ms per attempt
   maxRetries: 2,                           // network errors, 408, 429 (honours retry-after), 5xx
   fetch: customFetch,                      // optional
-  onRequest: ({ method, url, attempt, idempotencyKey }) => {},           // optional, once per attempt
+  onRequest: ({ method, url, attempt, idempotencyKey }) => {},           // optional, once per attempt (from 1)
   onResponse: ({ status, requestId, idempotentReplayed, durationMs, error }) => {}, // optional
 });
 ```
@@ -60,7 +60,7 @@ new Trackified({
 ### Hooks
 
 `onRequest` and `onResponse` are called once per attempt, so a retried request calls each of them several times
-(`attempt` is 0, 1, 2 ...). `onResponse` gets `status` (undefined when no response arrived), `requestId`
+(`attempt` is 1 for the first try, then 2, 3 ...). `onResponse` gets `status` (undefined when no response arrived), `requestId`
 (the `x-request-id` header), `idempotentReplayed` (the `idempotent-replayed` header), `durationMs`, and `error`, the
 typed error for a status of 400 or above or a failed connection. An error thrown by a hook is caught and ignored,
 so it never breaks the request.

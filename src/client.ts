@@ -35,7 +35,7 @@ import { constructEvent, getCrypto, trackingOf, verify, verifyDetailed, webhookH
 export interface RequestHookInfo {
   method: string;
   url: string;
-  /** 0 for the first try, then 1, 2 ... for retries. */
+  /** 1 for the first try, then 2, 3 ... for retries. */
   attempt: number;
   idempotencyKey: string | undefined;
 }
@@ -164,7 +164,7 @@ export class Trackified {
     };
 
     for (let attempt = 0; ; attempt++) {
-      hook(this.#onRequest, { ...hookBase, attempt });
+      hook(this.#onRequest, { ...hookBase, attempt: attempt + 1 });
       const started = Date.now();
       const controller = new AbortController();
       const onAbort = () => controller.abort(init.signal?.reason);
@@ -183,7 +183,7 @@ export class Trackified {
             });
         hook(this.#onResponse, {
           ...hookBase,
-          attempt,
+          attempt: attempt + 1,
           status: undefined,
           requestId: undefined,
           idempotentReplayed: false,
@@ -203,7 +203,7 @@ export class Trackified {
 
       const info = {
         ...hookBase,
-        attempt,
+        attempt: attempt + 1,
         status: res.status,
         requestId: res.headers.get("x-request-id") ?? undefined,
         idempotentReplayed: res.headers.get("idempotent-replayed") === "true",
